@@ -20,6 +20,67 @@ use serde::{Deserialize, Serialize};
 use xml::writer::{EventWriter, XmlEvent};
 use midir::{MidiOutput, MidiOutputConnection};
 
+// Color theme constants
+struct ColorTheme;
+
+impl ColorTheme {
+    // Musical elements
+    const STAFF_LINES: Color = Color::Rgb(100, 100, 120);        // Subtle blue-gray for staff lines
+    const NOTES_C: Color = Color::Rgb(255, 100, 100);           // Red for C notes
+    const NOTES_D: Color = Color::Rgb(255, 165, 0);             // Orange for D notes
+    const NOTES_E: Color = Color::Rgb(255, 255, 100);           // Yellow for E notes
+    const NOTES_F: Color = Color::Rgb(100, 255, 100);           // Green for F notes
+    const NOTES_G: Color = Color::Rgb(100, 200, 255);           // Light blue for G notes
+    const NOTES_A: Color = Color::Rgb(150, 100, 255);           // Purple for A notes
+    const NOTES_B: Color = Color::Rgb(255, 100, 200);           // Pink for B notes
+    
+    // Accidentals
+    const SHARP: Color = Color::Rgb(255, 215, 0);               // Gold for sharps
+    const FLAT: Color = Color::Rgb(70, 130, 180);               // Steel blue for flats
+    const NATURAL: Color = Color::Rgb(169, 169, 169);           // Gray for naturals
+    
+    // Interface elements  
+    const CURSOR: Color = Color::Rgb(255, 255, 255);            // Bright white cursor
+    const CURSOR_BG: Color = Color::Rgb(50, 50, 200);           // Blue cursor background
+    const CURRENT_STAFF: Color = Color::Rgb(255, 255, 255);     // White for current staff
+    const INACTIVE_STAFF: Color = Color::Rgb(120, 120, 120);    // Gray for inactive staves
+    
+    // Signature changes
+    const TIME_SIGNATURE: Color = Color::Rgb(255, 165, 0);      // Orange for time signatures
+    const KEY_SIGNATURE: Color = Color::Rgb(50, 205, 50);       // Lime green for key signatures
+    
+    // Ties and beams
+    const TIES: Color = Color::Rgb(255, 192, 203);              // Light pink for ties
+    const BEAMS: Color = Color::Rgb(192, 192, 192);             // Silver for beams
+    
+    // Rests
+    const RESTS: Color = Color::Rgb(150, 150, 150);             // Gray for rests
+    
+    // Special symbols
+    const TUPLETS: Color = Color::Rgb(138, 43, 226);            // Blue violet for tuplets
+    const SCROLL_INDICATORS: Color = Color::Rgb(255, 215, 0);   // Gold for scroll arrows
+    
+    fn note_color(pitch: &Pitch) -> Color {
+        match pitch {
+            Pitch::C4 => Self::NOTES_C,
+            Pitch::D4 => Self::NOTES_D,
+            Pitch::E4 => Self::NOTES_E,
+            Pitch::F4 => Self::NOTES_F,
+            Pitch::G4 => Self::NOTES_G,
+            Pitch::A4 => Self::NOTES_A,
+            Pitch::B4 => Self::NOTES_B,
+        }
+    }
+    
+    fn accidental_color(accidental: &Accidental) -> Color {
+        match accidental {
+            Accidental::Sharp => Self::SHARP,
+            Accidental::Flat => Self::FLAT,
+            Accidental::Natural => Self::NATURAL,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Staff {
     notes: Vec<Note>,
@@ -985,20 +1046,33 @@ fn ui(f: &mut Frame, app: &App) {
         String::new()
     };
     
+    // Create colorized title
+    let title_line = Line::from(vec![
+        Span::styled("🎼 Score", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::raw(" - Staff "),
+        Span::styled(format!("{}", app.current_staff + 1), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::raw("/"),
+        Span::styled(format!("{}", app.staves.len()), Style::default().fg(Color::Yellow)),
+        Span::raw(" | "),
+        Span::styled(format!("{}/{}", current_staff.time_signature.numerator, current_staff.time_signature.denominator), 
+                    Style::default().fg(ColorTheme::TIME_SIGNATURE).add_modifier(Modifier::BOLD)),
+        Span::raw(" Time | "),
+        Span::styled(format_key_signature(&current_staff.key_signature), 
+                    Style::default().fg(ColorTheme::KEY_SIGNATURE).add_modifier(Modifier::BOLD)),
+        Span::raw(" Key"),
+        Span::styled(scroll_info, Style::default().fg(Color::Cyan)),
+        Span::styled(sig_changes_info, Style::default().fg(Color::Green)),
+        if app.is_playing {
+            Span::styled(" ♪ PLAYING ♪", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD).add_modifier(Modifier::SLOW_BLINK))
+        } else {
+            Span::raw("")
+        }
+    ]);
+    
     let staff_block = Block::default()
-        .title(format!(
-            "🎼 Score - Staff {}/{} | {}/{} Time | {} Key{}{}{}",
-            app.current_staff + 1,
-            app.staves.len(),
-            current_staff.time_signature.numerator,
-            current_staff.time_signature.denominator,
-            format_key_signature(&current_staff.key_signature),
-            scroll_info,
-            sig_changes_info,
-            if app.is_playing { " ♪ PLAYING ♪" } else { "" }
-        ))
+        .title(title_line)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Blue));
+        .border_style(Style::default().fg(ColorTheme::STAFF_LINES));
     let staff = Paragraph::new(staff_content)
         .block(staff_block);
     
@@ -1010,24 +1084,81 @@ fn ui(f: &mut Frame, app: &App) {
         _ => " | 3=tuplets(off)",
     };
     
-    let help_text = format!(
-        "Controls: ←→=cursor, ↑↓=staff, Home/End=jump, PgUp/PgDn=scroll, notes=c/d/e/f/g/a/b, SPACE=duration({}), #=accidental({}), t=tie, Shift+T=time sig, Shift+K=key sig, Shift+R=remove sig, F1=setup{}, +=add, -=remove, p=play, x=export, s=save, l=load, DEL=delete, q=quit",
-        match app.current_duration {
-            Duration::Whole => "whole",
-            Duration::Half => "half", 
-            Duration::Quarter => "quarter",
-            Duration::Eighth => "eighth",
-            Duration::Sixteenth => "sixteenth",
-        },
-        match app.current_accidental {
-            Accidental::Natural => "natural",
-            Accidental::Sharp => "sharp",
-            Accidental::Flat => "flat",
-        },
-        tuplet_text
-    );
-    let help = Paragraph::new(help_text)
-        .block(Block::default().title("Help").borders(Borders::ALL));
+    // Create colorized help text
+    let current_duration_text = match app.current_duration {
+        Duration::Whole => "whole",
+        Duration::Half => "half", 
+        Duration::Quarter => "quarter",
+        Duration::Eighth => "eighth",
+        Duration::Sixteenth => "sixteenth",
+    };
+    
+    let current_accidental_text = match app.current_accidental {
+        Accidental::Natural => "natural",
+        Accidental::Sharp => "sharp",
+        Accidental::Flat => "flat",
+    };
+
+    let help_line = Line::from(vec![
+        Span::styled("Controls: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("←→", Style::default().fg(ColorTheme::SCROLL_INDICATORS)),
+        Span::raw("=cursor, "),
+        Span::styled("↑↓", Style::default().fg(ColorTheme::SCROLL_INDICATORS)),
+        Span::raw("=staff, "),
+        Span::styled("Home/End", Style::default().fg(Color::Cyan)),
+        Span::raw("=jump, "),
+        Span::styled("PgUp/PgDn", Style::default().fg(Color::Cyan)),
+        Span::raw("=scroll, notes="),
+        Span::styled("c", Style::default().fg(ColorTheme::NOTES_C).add_modifier(Modifier::BOLD)),
+        Span::raw("/"),
+        Span::styled("d", Style::default().fg(ColorTheme::NOTES_D).add_modifier(Modifier::BOLD)),
+        Span::raw("/"),
+        Span::styled("e", Style::default().fg(ColorTheme::NOTES_E).add_modifier(Modifier::BOLD)),
+        Span::raw("/"),
+        Span::styled("f", Style::default().fg(ColorTheme::NOTES_F).add_modifier(Modifier::BOLD)),
+        Span::raw("/"),
+        Span::styled("g", Style::default().fg(ColorTheme::NOTES_G).add_modifier(Modifier::BOLD)),
+        Span::raw("/"),
+        Span::styled("a", Style::default().fg(ColorTheme::NOTES_A).add_modifier(Modifier::BOLD)),
+        Span::raw("/"),
+        Span::styled("b", Style::default().fg(ColorTheme::NOTES_B).add_modifier(Modifier::BOLD)),
+        Span::raw(", "),
+        Span::styled("SPACE", Style::default().fg(Color::Green)),
+        Span::raw("=duration("),
+        Span::styled(current_duration_text, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::raw("), "),
+        Span::styled("#", Style::default().fg(ColorTheme::SHARP)),
+        Span::raw("=accidental("),
+        Span::styled(current_accidental_text, Style::default().fg(ColorTheme::accidental_color(&app.current_accidental)).add_modifier(Modifier::BOLD)),
+        Span::raw("), "),
+        Span::styled("t", Style::default().fg(ColorTheme::TIES)),
+        Span::raw("=tie, "),
+        Span::styled("Shift+T", Style::default().fg(ColorTheme::TIME_SIGNATURE)),
+        Span::raw("=time sig, "),
+        Span::styled("Shift+K", Style::default().fg(ColorTheme::KEY_SIGNATURE)),
+        Span::raw("=key sig, "),
+        Span::styled("Shift+R", Style::default().fg(Color::Red)),
+        Span::raw("=remove sig, "),
+        Span::styled("F1", Style::default().fg(Color::Magenta)),
+        Span::raw("=setup"),
+        Span::styled(tuplet_text, Style::default().fg(ColorTheme::TUPLETS)),
+        Span::raw(", "),
+        Span::styled("+/-", Style::default().fg(Color::Blue)),
+        Span::raw("=add/remove, "),
+        Span::styled("p", Style::default().fg(Color::Green)),
+        Span::raw("=play, "),
+        Span::styled("x", Style::default().fg(Color::Cyan)),
+        Span::raw("=export, "),
+        Span::styled("s/l", Style::default().fg(Color::Yellow)),
+        Span::raw("=save/load, "),
+        Span::styled("DEL", Style::default().fg(Color::Red)),
+        Span::raw("=delete, "),
+        Span::styled("q", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::raw("=quit")
+    ]);
+    
+    let help = Paragraph::new(vec![help_line])
+        .block(Block::default().title("Help").borders(Borders::ALL).border_style(Style::default().fg(Color::Blue)));
     
     f.render_widget(help, chunks[1]);
 }
@@ -1141,10 +1272,10 @@ fn render_all_staves(app: &App) -> Text<'_> {
     
     for (staff_idx, staff) in app.staves.iter().enumerate() {
         if staff_idx > 0 {
-            all_lines.push("".to_string());
+            all_lines.push(Line::from(""));
         }
         
-        let staff_lines = render_single_staff(staff, staff_idx == app.current_staff, app.viewport_width);
+        let staff_lines = render_single_staff_colored(staff, staff_idx == app.current_staff, app.viewport_width);
         all_lines.extend(staff_lines);
     }
     
@@ -1155,34 +1286,39 @@ fn render_all_staves(app: &App) -> Text<'_> {
         } else {
             "                    <<< Scrolling Left <<<"
         };
-        all_lines.push("".to_string());
-        all_lines.push(scroll_hint.to_string());
+        all_lines.push(Line::from(""));
+        all_lines.push(Line::from(vec![
+            Span::styled(scroll_hint, Style::default().fg(ColorTheme::SCROLL_INDICATORS).add_modifier(Modifier::BOLD))
+        ]));
     }
     
-    Text::raw(all_lines.join("\n"))
+    Text::from(all_lines)
 }
 
-fn render_single_staff(staff: &Staff, is_current: bool, viewport_width: usize) -> Vec<String> {
-    let line_char = if is_current { "─" } else { "·" };
-    let space_char = if is_current { " " } else { " " };
+
+fn render_single_staff_colored(staff: &Staff, is_current: bool, viewport_width: usize) -> Vec<Line<'static>> {
+    let staff_color = if is_current { ColorTheme::CURRENT_STAFF } else { ColorTheme::INACTIVE_STAFF };
+    let _line_char = if is_current { "─" } else { "·" };
+    let _space_char = " ";
     
     // Calculate visible range based on scroll offset
     let start_pos = staff.scroll_offset;
     let end_pos = (start_pos + viewport_width).min(staff.max_length);
     let visible_width = (end_pos - start_pos) * 5;
     
-    let mut staff_lines = vec![
-        format!("{}", space_char.repeat(visible_width)), // E5 line
-        format!("{}", space_char.repeat(visible_width)), // D5 space
-        format!("{}", line_char.repeat(visible_width)), // C5 line
-        format!("{}", space_char.repeat(visible_width)), // B4 space
-        format!("{}", line_char.repeat(visible_width)), // A4 line
-        format!("{}", space_char.repeat(visible_width)), // G4 space
-        format!("{}", line_char.repeat(visible_width)), // F4 line
-        format!("{}", space_char.repeat(visible_width)), // E4 space
-        format!("{}", line_char.repeat(visible_width)), // D4 line
-        format!("{}", space_char.repeat(visible_width)), // C4 space
-        format!("{}", line_char.repeat(visible_width)), // B3 line
+    // Create base staff lines with colors
+    let mut staff_lines: Vec<Vec<(char, Style)>> = vec![
+        vec![(' ', Style::default().fg(staff_color)); visible_width], // E5 line
+        vec![(' ', Style::default().fg(staff_color)); visible_width], // D5 space
+        vec![('─', Style::default().fg(ColorTheme::STAFF_LINES)); visible_width], // C5 line
+        vec![(' ', Style::default().fg(staff_color)); visible_width], // B4 space
+        vec![('─', Style::default().fg(ColorTheme::STAFF_LINES)); visible_width], // A4 line
+        vec![(' ', Style::default().fg(staff_color)); visible_width], // G4 space
+        vec![('─', Style::default().fg(ColorTheme::STAFF_LINES)); visible_width], // F4 line
+        vec![(' ', Style::default().fg(staff_color)); visible_width], // E4 space
+        vec![('─', Style::default().fg(ColorTheme::STAFF_LINES)); visible_width], // D4 line
+        vec![(' ', Style::default().fg(staff_color)); visible_width], // C4 space
+        vec![('─', Style::default().fg(ColorTheme::STAFF_LINES)); visible_width], // B3 line
     ];
     
     // Add default rests to empty positions in visible range
@@ -1192,51 +1328,49 @@ fn render_single_staff(staff: &Staff, is_current: bool, viewport_width: usize) -
         let has_signature_change = staff.signature_changes.iter().any(|change| change.position == position);
         
         if !has_note && !has_signature_change && pos < staff_lines[8].len() {
-            staff_lines[8].replace_range(pos..pos+1, "𝄽"); // Quarter rest on middle line
+            staff_lines[8][pos] = ('𝄽', Style::default().fg(ColorTheme::RESTS));
         }
     }
     
     // Render signature changes in visible range
     for change in &staff.signature_changes {
         if change.position < start_pos || change.position >= end_pos {
-            continue; // Skip changes outside viewport
+            continue;
         }
         
         let pos = (change.position - start_pos) * 5;
         if pos < staff_lines[0].len() {
             match &change.change_type {
                 SignatureChangeType::TimeSignature(time_sig) => {
-                    // Place time signature above the staff
                     let time_sig_text = format!("{}/{}", time_sig.numerator, time_sig.denominator);
-                    if pos + time_sig_text.len() <= staff_lines[0].len() {
-                        staff_lines[0].replace_range(pos..pos+time_sig_text.len(), &time_sig_text);
+                    for (i, ch) in time_sig_text.chars().enumerate() {
+                        if pos + i < staff_lines[0].len() {
+                            staff_lines[0][pos + i] = (ch, Style::default().fg(ColorTheme::TIME_SIGNATURE).add_modifier(Modifier::BOLD));
+                        }
                     }
-                    // Add a vertical line to mark the change
-                    if pos < staff_lines[2].len() {
-                        staff_lines[2].replace_range(pos..pos+1, "│");
-                        staff_lines[4].replace_range(pos..pos+1, "│");
-                        staff_lines[6].replace_range(pos..pos+1, "│");
-                        staff_lines[8].replace_range(pos..pos+1, "│");
-                        staff_lines[10].replace_range(pos..pos+1, "│");
+                    // Add colored vertical line
+                    for line_idx in [2, 4, 6, 8, 10] {
+                        if pos < staff_lines[line_idx].len() {
+                            staff_lines[line_idx][pos] = ('│', Style::default().fg(ColorTheme::TIME_SIGNATURE));
+                        }
                     }
                 }
                 SignatureChangeType::KeySignature(key_sig) => {
-                    // Place key signature below the staff
                     let key_text = match key_sig.sharps {
                         0 => "C".to_string(),
                         s if s > 0 => format!("{}♯", s),
                         s => format!("{}♭", -s),
                     };
-                    if pos + key_text.len() <= staff_lines[10].len() {
-                        staff_lines[10].replace_range(pos..pos+key_text.len(), &key_text);
+                    for (i, ch) in key_text.chars().enumerate() {
+                        if pos + i < staff_lines[10].len() {
+                            staff_lines[10][pos + i] = (ch, Style::default().fg(ColorTheme::KEY_SIGNATURE).add_modifier(Modifier::BOLD));
+                        }
                     }
-                    // Add a vertical line to mark the change
-                    if pos < staff_lines[2].len() {
-                        staff_lines[2].replace_range(pos..pos+1, "│");
-                        staff_lines[4].replace_range(pos..pos+1, "│");
-                        staff_lines[6].replace_range(pos..pos+1, "│");
-                        staff_lines[8].replace_range(pos..pos+1, "│");
-                        staff_lines[10].replace_range(pos..pos+1, "│");
+                    // Add colored vertical line
+                    for line_idx in [2, 4, 6, 8, 10] {
+                        if pos < staff_lines[line_idx].len() {
+                            staff_lines[line_idx][pos] = ('│', Style::default().fg(ColorTheme::KEY_SIGNATURE));
+                        }
                     }
                 }
             }
@@ -1246,7 +1380,7 @@ fn render_single_staff(staff: &Staff, is_current: bool, viewport_width: usize) -
     // Render notes in visible range
     for note in &staff.notes {
         if note.position < start_pos || note.position >= end_pos {
-            continue; // Skip notes outside viewport
+            continue;
         }
         
         let line_idx = match note.pitch {
@@ -1262,29 +1396,39 @@ fn render_single_staff(staff: &Staff, is_current: bool, viewport_width: usize) -
         let pos = (note.position - start_pos) * 5;
         if pos < staff_lines[line_idx].len() {
             let note_symbol = match note.duration {
-                Duration::Whole => "○",
-                Duration::Half => "♩", 
-                Duration::Quarter => "●",
-                Duration::Eighth => if note.beam_group.is_some() { "♪" } else { "♫" },
-                Duration::Sixteenth => "♬",
+                Duration::Whole => '○',
+                Duration::Half => '♩', 
+                Duration::Quarter => '●',
+                Duration::Eighth => if note.beam_group.is_some() { '♪' } else { '♫' },
+                Duration::Sixteenth => '♬',
             };
             
-            let accidental_symbol = match note.accidental {
-                Accidental::Natural => "",
-                Accidental::Sharp => "#",
-                Accidental::Flat => "♭",
-            };
+            let note_color = ColorTheme::note_color(&note.pitch);
+            let mut note_style = Style::default().fg(note_color).add_modifier(Modifier::BOLD);
             
-            if !accidental_symbol.is_empty() && pos > 0 {
-                staff_lines[line_idx].replace_range(pos-1..pos, accidental_symbol);
+            // Add tuplet styling
+            if note.tuplet_group.is_some() {
+                note_style = note_style.bg(ColorTheme::TUPLETS);
             }
-            staff_lines[line_idx].replace_range(pos..pos+1, note_symbol);
             
-            if note.tied_to_next {
-                let tie_pos = pos + 1;
-                if tie_pos < staff_lines[line_idx].len() {
-                    staff_lines[line_idx].replace_range(tie_pos..tie_pos+1, "⌢");
+            // Render accidental
+            let accidental_symbol = match note.accidental {
+                Accidental::Natural => None,
+                Accidental::Sharp => Some('#'),
+                Accidental::Flat => Some('♭'),
+            };
+            
+            if let Some(acc_char) = accidental_symbol {
+                if pos > 0 {
+                    staff_lines[line_idx][pos-1] = (acc_char, Style::default().fg(ColorTheme::accidental_color(&note.accidental)).add_modifier(Modifier::BOLD));
                 }
+            }
+            
+            staff_lines[line_idx][pos] = (note_symbol, note_style);
+            
+            // Render tie
+            if note.tied_to_next && pos + 1 < staff_lines[line_idx].len() {
+                staff_lines[line_idx][pos + 1] = ('⌢', Style::default().fg(ColorTheme::TIES));
             }
         }
     }
@@ -1294,8 +1438,8 @@ fn render_single_staff(staff: &Staff, is_current: bool, viewport_width: usize) -
         let cursor_pos = (staff.cursor_position - start_pos) * 5;
         if cursor_pos < staff_lines[0].len() {
             for line in staff_lines.iter_mut() {
-                if line.chars().nth(cursor_pos).unwrap_or(' ') == ' ' {
-                    line.replace_range(cursor_pos..cursor_pos+1, "║");
+                if line[cursor_pos].0 == ' ' {
+                    line[cursor_pos] = ('║', Style::default().fg(ColorTheme::CURSOR).bg(ColorTheme::CURSOR_BG).add_modifier(Modifier::BOLD));
                 }
             }
         }
@@ -1306,8 +1450,8 @@ fn render_single_staff(staff: &Staff, is_current: bool, viewport_width: usize) -
         if start_pos > 0 {
             // Left scroll indicator
             for line in staff_lines.iter_mut() {
-                if line.len() > 0 {
-                    line.replace_range(0..1, "◀");
+                if !line.is_empty() {
+                    line[0] = ('◀', Style::default().fg(ColorTheme::SCROLL_INDICATORS).add_modifier(Modifier::BOLD));
                 }
             }
         }
@@ -1316,13 +1460,19 @@ fn render_single_staff(staff: &Staff, is_current: bool, viewport_width: usize) -
             for line in staff_lines.iter_mut() {
                 let last_pos = line.len().saturating_sub(1);
                 if last_pos > 0 {
-                    line.replace_range(last_pos..last_pos+1, "▶");
+                    line[last_pos] = ('▶', Style::default().fg(ColorTheme::SCROLL_INDICATORS).add_modifier(Modifier::BOLD));
                 }
             }
         }
     }
 
-    staff_lines
+    // Convert to Lines
+    staff_lines.into_iter().map(|line| {
+        let spans: Vec<Span> = line.into_iter().map(|(ch, style)| {
+            Span::styled(ch.to_string(), style)
+        }).collect();
+        Line::from(spans)
+    }).collect()
 }
 
 fn format_key_signature(key_sig: &KeySignature) -> String {
