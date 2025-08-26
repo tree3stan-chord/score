@@ -28,6 +28,19 @@ struct Staff {
     key_signature: KeySignature,
     scroll_offset: usize,
     max_length: usize,
+    signature_changes: Vec<SignatureChange>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SignatureChange {
+    position: usize,
+    change_type: SignatureChangeType,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+enum SignatureChangeType {
+    TimeSignature(TimeSignature),
+    KeySignature(KeySignature),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -119,6 +132,7 @@ impl App {
             key_signature: KeySignature { sharps: 0 },
             scroll_offset: 0,
             max_length: 64, // Start with 64 beats, can expand
+            signature_changes: Vec::new(),
         }];
         
         let midi_out = Self::init_midi().ok();
@@ -270,6 +284,7 @@ impl App {
                 key_signature: KeySignature { sharps: 0 },
                 scroll_offset: 0,
                 max_length: 64,
+                signature_changes: Vec::new(),
             });
         }
     }
@@ -358,6 +373,134 @@ impl App {
         }
     }
     
+    fn insert_time_signature_change(&mut self) {
+        self.save_to_history();
+        
+        if let Some(staff) = self.staves.get_mut(self.current_staff) {
+            let cursor_pos = staff.cursor_position;
+            
+            // Remove any existing time sig change at this position
+            staff.signature_changes.retain(|change| {
+                !(change.position == cursor_pos && matches!(change.change_type, SignatureChangeType::TimeSignature(_)))
+            });
+            
+            // Cycle through common time signatures
+            let mut current_time_sig = staff.time_signature.clone();
+            for change in &staff.signature_changes {
+                if change.position <= cursor_pos {
+                    if let SignatureChangeType::TimeSignature(ts) = &change.change_type {
+                        current_time_sig = ts.clone();
+                    }
+                }
+            }
+            
+            let new_time_sig = match (current_time_sig.numerator, current_time_sig.denominator) {
+                (4, 4) => TimeSignature { numerator: 3, denominator: 4 },
+                (3, 4) => TimeSignature { numerator: 2, denominator: 4 },
+                (2, 4) => TimeSignature { numerator: 6, denominator: 8 },
+                (6, 8) => TimeSignature { numerator: 9, denominator: 8 },
+                (9, 8) => TimeSignature { numerator: 12, denominator: 8 },
+                (12, 8) => TimeSignature { numerator: 5, denominator: 4 },
+                (5, 4) => TimeSignature { numerator: 7, denominator: 4 },
+                (7, 4) => TimeSignature { numerator: 4, denominator: 4 }, // Back to start
+                _ => TimeSignature { numerator: 4, denominator: 4 },
+            };
+            
+            staff.signature_changes.push(SignatureChange {
+                position: cursor_pos,
+                change_type: SignatureChangeType::TimeSignature(new_time_sig),
+            });
+            
+            // Sort by position
+            staff.signature_changes.sort_by_key(|change| change.position);
+        }
+    }
+    
+    fn insert_key_signature_change(&mut self) {
+        self.save_to_history();
+        
+        if let Some(staff) = self.staves.get_mut(self.current_staff) {
+            let cursor_pos = staff.cursor_position;
+            
+            // Remove any existing key sig change at this position
+            staff.signature_changes.retain(|change| {
+                !(change.position == cursor_pos && matches!(change.change_type, SignatureChangeType::KeySignature(_)))
+            });
+            
+            // Cycle through key signatures
+            let mut current_key_sig = staff.key_signature.clone();
+            for change in &staff.signature_changes {
+                if change.position <= cursor_pos {
+                    if let SignatureChangeType::KeySignature(ks) = &change.change_type {
+                        current_key_sig = ks.clone();
+                    }
+                }
+            }
+            
+            let new_sharps = match current_key_sig.sharps {
+                s if s < 7 => s + 1,
+                7 => -7,
+                s if s < 0 => s + 1,
+                _ => 0,
+            };
+            
+            staff.signature_changes.push(SignatureChange {
+                position: cursor_pos,
+                change_type: SignatureChangeType::KeySignature(KeySignature { sharps: new_sharps }),
+            });
+            
+            // Sort by position
+            staff.signature_changes.sort_by_key(|change| change.position);
+        }
+    }
+    
+    fn get_effective_time_signature(&self, position: usize) -> TimeSignature {
+        if let Some(staff) = self.staves.get(self.current_staff) {
+            // Find the most recent time signature change at or before this position
+            let mut current_time_sig = staff.time_signature.clone();
+            
+            for change in &staff.signature_changes {
+                if change.position <= position {
+                    if let SignatureChangeType::TimeSignature(time_sig) = &change.change_type {
+                        current_time_sig = time_sig.clone();
+                    }
+                }
+            }
+            
+            current_time_sig
+        } else {
+            TimeSignature { numerator: 4, denominator: 4 }
+        }
+    }
+    
+    fn get_effective_key_signature(&self, position: usize) -> KeySignature {
+        if let Some(staff) = self.staves.get(self.current_staff) {
+            // Find the most recent key signature change at or before this position
+            let mut current_key_sig = staff.key_signature.clone();
+            
+            for change in &staff.signature_changes {
+                if change.position <= position {
+                    if let SignatureChangeType::KeySignature(key_sig) = &change.change_type {
+                        current_key_sig = key_sig.clone();
+                    }
+                }
+            }
+            
+            current_key_sig
+        } else {
+            KeySignature { sharps: 0 }
+        }
+    }
+    
+    fn remove_signature_change(&mut self) {
+        self.save_to_history();
+        
+        if let Some(staff) = self.staves.get_mut(self.current_staff) {
+            let cursor_pos = staff.cursor_position;
+            staff.signature_changes.retain(|change| change.position != cursor_pos);
+        }
+    }
+    
     fn save_to_history(&mut self) {
         let current_score = Score { staves: self.staves.clone() };
         if self.history_index + 1 < self.history.len() {
@@ -417,91 +560,124 @@ impl App {
                 let part_id = format!("P{}", staff_idx + 1);
                 writer.write(XmlEvent::start_element("part").attr("id", &part_id))?;
                 
-                // Measure
-                writer.write(XmlEvent::start_element("measure").attr("number", "1"))?;
+                // Create measures based on signature changes and time signatures
+                let max_position = staff.notes.iter().map(|n| n.position).max().unwrap_or(0);
+                let mut current_measure = 1;
+                let mut current_position = 0;
+                let mut current_time_sig = staff.time_signature.clone();
+                let mut current_key_sig = staff.key_signature.clone();
                 
-                // Attributes (time signature, key signature)
-                writer.write(XmlEvent::start_element("attributes"))?;
+                // Get all signature change positions
+                let mut sig_positions: Vec<usize> = staff.signature_changes.iter().map(|sc| sc.position).collect();
+                sig_positions.sort();
+                sig_positions.dedup();
                 
-                writer.write(XmlEvent::start_element("time"))?;
-                writer.write(XmlEvent::start_element("beats"))?;
-                writer.write(XmlEvent::characters(&staff.time_signature.numerator.to_string()))?;
-                writer.write(XmlEvent::end_element())?;
-                writer.write(XmlEvent::start_element("beat-type"))?;
-                writer.write(XmlEvent::characters(&staff.time_signature.denominator.to_string()))?;
-                writer.write(XmlEvent::end_element())?;
-                writer.write(XmlEvent::end_element())?; // time
-                
-                if staff.key_signature.sharps != 0 {
-                    writer.write(XmlEvent::start_element("key"))?;
-                    writer.write(XmlEvent::start_element("fifths"))?;
-                    writer.write(XmlEvent::characters(&staff.key_signature.sharps.to_string()))?;
-                    writer.write(XmlEvent::end_element())?;
-                    writer.write(XmlEvent::end_element())?; // key
-                }
-                
-                writer.write(XmlEvent::end_element())?; // attributes
-                
-                // Notes
-                for note in &staff.notes {
-                    writer.write(XmlEvent::start_element("note"))?;
+                while current_position <= max_position {
+                    writer.write(XmlEvent::start_element("measure").attr("number", &current_measure.to_string()))?;
                     
-                    writer.write(XmlEvent::start_element("pitch"))?;
-                    let (step, octave) = match note.pitch {
-                        Pitch::C4 => ("C", "4"),
-                        Pitch::D4 => ("D", "4"),
-                        Pitch::E4 => ("E", "4"),
-                        Pitch::F4 => ("F", "4"),
-                        Pitch::G4 => ("G", "4"),
-                        Pitch::A4 => ("A", "4"),
-                        Pitch::B4 => ("B", "4"),
-                    };
-                    writer.write(XmlEvent::start_element("step"))?;
-                    writer.write(XmlEvent::characters(step))?;
-                    writer.write(XmlEvent::end_element())?;
-                    
-                    if note.accidental != Accidental::Natural {
-                        writer.write(XmlEvent::start_element("alter"))?;
-                        let alter = match note.accidental {
-                            Accidental::Sharp => "1",
-                            Accidental::Flat => "-1",
-                            _ => "0",
-                        };
-                        writer.write(XmlEvent::characters(alter))?;
-                        writer.write(XmlEvent::end_element())?;
+                    // Check if we need to write signature changes at this position
+                    let mut need_attributes = current_measure == 1; // Always write initial attributes
+                    for change in &staff.signature_changes {
+                        if change.position == current_position {
+                            need_attributes = true;
+                            match &change.change_type {
+                                SignatureChangeType::TimeSignature(ts) => current_time_sig = ts.clone(),
+                                SignatureChangeType::KeySignature(ks) => current_key_sig = ks.clone(),
+                            }
+                        }
                     }
                     
-                    writer.write(XmlEvent::start_element("octave"))?;
-                    writer.write(XmlEvent::characters(octave))?;
-                    writer.write(XmlEvent::end_element())?;
-                    writer.write(XmlEvent::end_element())?; // pitch
+                    if need_attributes {
+                        writer.write(XmlEvent::start_element("attributes"))?;
+                        
+                        writer.write(XmlEvent::start_element("time"))?;
+                        writer.write(XmlEvent::start_element("beats"))?;
+                        writer.write(XmlEvent::characters(&current_time_sig.numerator.to_string()))?;
+                        writer.write(XmlEvent::end_element())?;
+                        writer.write(XmlEvent::start_element("beat-type"))?;
+                        writer.write(XmlEvent::characters(&current_time_sig.denominator.to_string()))?;
+                        writer.write(XmlEvent::end_element())?;
+                        writer.write(XmlEvent::end_element())?; // time
+                        
+                        writer.write(XmlEvent::start_element("key"))?;
+                        writer.write(XmlEvent::start_element("fifths"))?;
+                        writer.write(XmlEvent::characters(&current_key_sig.sharps.to_string()))?;
+                        writer.write(XmlEvent::end_element())?;
+                        writer.write(XmlEvent::end_element())?; // key
+                        
+                        writer.write(XmlEvent::end_element())?; // attributes
+                    }
                     
-                    writer.write(XmlEvent::start_element("duration"))?;
-                    let duration_value = match note.duration {
-                        Duration::Whole => "4",
-                        Duration::Half => "2",
-                        Duration::Quarter => "1",
-                        Duration::Eighth => "0.5",
-                        Duration::Sixteenth => "0.25",
-                    };
-                    writer.write(XmlEvent::characters(duration_value))?;
-                    writer.write(XmlEvent::end_element())?;
+                    // Calculate beats per measure based on current time signature
+                    let beats_per_measure = current_time_sig.numerator;
+                    let end_position = std::cmp::min(current_position + beats_per_measure as usize, max_position + 1);
                     
-                    writer.write(XmlEvent::start_element("type"))?;
-                    let type_name = match note.duration {
-                        Duration::Whole => "whole",
-                        Duration::Half => "half",
-                        Duration::Quarter => "quarter",
-                        Duration::Eighth => "eighth",
-                        Duration::Sixteenth => "16th",
-                    };
-                    writer.write(XmlEvent::characters(type_name))?;
-                    writer.write(XmlEvent::end_element())?;
+                    // Notes in this measure
+                    for note in staff.notes.iter().filter(|n| n.position >= current_position && n.position < end_position) {
+                        writer.write(XmlEvent::start_element("note"))?;
+                        
+                        writer.write(XmlEvent::start_element("pitch"))?;
+                        let (step, octave) = match note.pitch {
+                            Pitch::C4 => ("C", "4"),
+                            Pitch::D4 => ("D", "4"),
+                            Pitch::E4 => ("E", "4"),
+                            Pitch::F4 => ("F", "4"),
+                            Pitch::G4 => ("G", "4"),
+                            Pitch::A4 => ("A", "4"),
+                            Pitch::B4 => ("B", "4"),
+                        };
+                        writer.write(XmlEvent::start_element("step"))?;
+                        writer.write(XmlEvent::characters(step))?;
+                        writer.write(XmlEvent::end_element())?;
+                        
+                        if note.accidental != Accidental::Natural {
+                            writer.write(XmlEvent::start_element("alter"))?;
+                            let alter = match note.accidental {
+                                Accidental::Sharp => "1",
+                                Accidental::Flat => "-1",
+                                _ => "0",
+                            };
+                            writer.write(XmlEvent::characters(alter))?;
+                            writer.write(XmlEvent::end_element())?;
+                        }
+                        
+                        writer.write(XmlEvent::start_element("octave"))?;
+                        writer.write(XmlEvent::characters(octave))?;
+                        writer.write(XmlEvent::end_element())?;
+                        writer.write(XmlEvent::end_element())?; // pitch
+                        
+                        writer.write(XmlEvent::start_element("duration"))?;
+                        let duration_value = match note.duration {
+                            Duration::Whole => "4",
+                            Duration::Half => "2",
+                            Duration::Quarter => "1",
+                            Duration::Eighth => "0.5",
+                            Duration::Sixteenth => "0.25",
+                        };
+                        writer.write(XmlEvent::characters(duration_value))?;
+                        writer.write(XmlEvent::end_element())?;
+                        
+                        writer.write(XmlEvent::start_element("type"))?;
+                        let type_name = match note.duration {
+                            Duration::Whole => "whole",
+                            Duration::Half => "half",
+                            Duration::Quarter => "quarter",
+                            Duration::Eighth => "eighth",
+                            Duration::Sixteenth => "16th",
+                        };
+                        writer.write(XmlEvent::characters(type_name))?;
+                        writer.write(XmlEvent::end_element())?;
+                        
+                        writer.write(XmlEvent::end_element())?; // note
+                    }
                     
-                    writer.write(XmlEvent::end_element())?; // note
+                    writer.write(XmlEvent::end_element())?; // measure
+                    
+                    // Move to next measure
+                    current_position = end_position;
+                    current_measure += 1;
                 }
                 
-                writer.write(XmlEvent::end_element())?; // measure
                 writer.write(XmlEvent::end_element())?; // part
             }
             
@@ -723,6 +899,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                 KeyCode::Char('-') => app.remove_staff(),
                 KeyCode::Char('t') => app.toggle_tie(),
                 KeyCode::Char('3') => app.toggle_triplet_mode(),
+                KeyCode::Char('T') if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) => {
+                    app.insert_time_signature_change();
+                },
+                KeyCode::Char('K') if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) => {
+                    app.insert_key_signature_change();
+                },
                 KeyCode::Char('T') => app.cycle_time_signature(),
                 KeyCode::Char('K') => app.cycle_key_signature(),
                 KeyCode::Char('z') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => app.undo(),
@@ -760,6 +942,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                         app.scroll_animation = 1.0;
                     }
                 },
+                KeyCode::Char('R') if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) => {
+                    app.remove_signature_change();
+                },
                 _ => {}
             }
         }
@@ -788,15 +973,28 @@ fn ui(f: &mut Frame, app: &App) {
         String::new()
     };
     
+    // Show current effective signatures
+    let current_time_sig = app.get_effective_time_signature(current_staff.cursor_position);
+    let current_key_sig = app.get_effective_key_signature(current_staff.cursor_position);
+    let sig_changes_info = if current_staff.signature_changes.len() > 0 {
+        format!(" | Current: {}/{} {}", 
+                current_time_sig.numerator, 
+                current_time_sig.denominator,
+                format_key_signature(&current_key_sig))
+    } else {
+        String::new()
+    };
+    
     let staff_block = Block::default()
         .title(format!(
-            "🎼 Score - Staff {}/{} | {}/{} Time | {} Key{}{}",
+            "🎼 Score - Staff {}/{} | {}/{} Time | {} Key{}{}{}",
             app.current_staff + 1,
             app.staves.len(),
             current_staff.time_signature.numerator,
             current_staff.time_signature.denominator,
             format_key_signature(&current_staff.key_signature),
             scroll_info,
+            sig_changes_info,
             if app.is_playing { " ♪ PLAYING ♪" } else { "" }
         ))
         .borders(Borders::ALL)
@@ -813,7 +1011,7 @@ fn ui(f: &mut Frame, app: &App) {
     };
     
     let help_text = format!(
-        "Controls: ←→=cursor, ↑↓=staff, Home/End=jump, PgUp/PgDn=scroll, notes=c/d/e/f/g/a/b, SPACE=duration({}), #=accidental({}), t=tie, F1=setup{}, +=add, -=remove, p=play, x=export, s=save, l=load, DEL=delete, q=quit",
+        "Controls: ←→=cursor, ↑↓=staff, Home/End=jump, PgUp/PgDn=scroll, notes=c/d/e/f/g/a/b, SPACE=duration({}), #=accidental({}), t=tie, Shift+T=time sig, Shift+K=key sig, Shift+R=remove sig, F1=setup{}, +=add, -=remove, p=play, x=export, s=save, l=load, DEL=delete, q=quit",
         match app.current_duration {
             Duration::Whole => "whole",
             Duration::Half => "half", 
@@ -991,8 +1189,57 @@ fn render_single_staff(staff: &Staff, is_current: bool, viewport_width: usize) -
     for position in start_pos..end_pos {
         let pos = (position - start_pos) * 5;
         let has_note = staff.notes.iter().any(|note| note.position == position);
-        if !has_note && pos < staff_lines[8].len() {
+        let has_signature_change = staff.signature_changes.iter().any(|change| change.position == position);
+        
+        if !has_note && !has_signature_change && pos < staff_lines[8].len() {
             staff_lines[8].replace_range(pos..pos+1, "𝄽"); // Quarter rest on middle line
+        }
+    }
+    
+    // Render signature changes in visible range
+    for change in &staff.signature_changes {
+        if change.position < start_pos || change.position >= end_pos {
+            continue; // Skip changes outside viewport
+        }
+        
+        let pos = (change.position - start_pos) * 5;
+        if pos < staff_lines[0].len() {
+            match &change.change_type {
+                SignatureChangeType::TimeSignature(time_sig) => {
+                    // Place time signature above the staff
+                    let time_sig_text = format!("{}/{}", time_sig.numerator, time_sig.denominator);
+                    if pos + time_sig_text.len() <= staff_lines[0].len() {
+                        staff_lines[0].replace_range(pos..pos+time_sig_text.len(), &time_sig_text);
+                    }
+                    // Add a vertical line to mark the change
+                    if pos < staff_lines[2].len() {
+                        staff_lines[2].replace_range(pos..pos+1, "│");
+                        staff_lines[4].replace_range(pos..pos+1, "│");
+                        staff_lines[6].replace_range(pos..pos+1, "│");
+                        staff_lines[8].replace_range(pos..pos+1, "│");
+                        staff_lines[10].replace_range(pos..pos+1, "│");
+                    }
+                }
+                SignatureChangeType::KeySignature(key_sig) => {
+                    // Place key signature below the staff
+                    let key_text = match key_sig.sharps {
+                        0 => "C".to_string(),
+                        s if s > 0 => format!("{}♯", s),
+                        s => format!("{}♭", -s),
+                    };
+                    if pos + key_text.len() <= staff_lines[10].len() {
+                        staff_lines[10].replace_range(pos..pos+key_text.len(), &key_text);
+                    }
+                    // Add a vertical line to mark the change
+                    if pos < staff_lines[2].len() {
+                        staff_lines[2].replace_range(pos..pos+1, "│");
+                        staff_lines[4].replace_range(pos..pos+1, "│");
+                        staff_lines[6].replace_range(pos..pos+1, "│");
+                        staff_lines[8].replace_range(pos..pos+1, "│");
+                        staff_lines[10].replace_range(pos..pos+1, "│");
+                    }
+                }
+            }
         }
     }
 
