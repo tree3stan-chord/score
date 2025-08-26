@@ -12,13 +12,31 @@ use ratatui::{
     Terminal, Frame,
 };
 use std::fs;
-use std::io::{self, stdout};
+use std::io::{self, stdout, Write};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration as StdDuration;
 use serde::{Deserialize, Serialize};
+use xml::writer::{EventWriter, XmlEvent};
+use midir::{MidiOutput, MidiOutputConnection};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Staff {
     notes: Vec<Note>,
     cursor_position: usize,
+    time_signature: TimeSignature,
+    key_signature: KeySignature,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TimeSignature {
+    numerator: u8,
+    denominator: u8,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct KeySignature {
+    sharps: i8, // positive for sharps, negative for flats
 }
 
 #[derive(Serialize, Deserialize)]
@@ -32,6 +50,12 @@ struct App {
     current_duration: Duration,
     current_accidental: Accidental,
     filename: String,
+    tuplet_mode: Option<(u8, u8)>,
+    history: Vec<Score>,
+    history_index: usize,
+    midi_out: Option<Arc<Mutex<MidiOutputConnection>>>,
+    playback_position: usize,
+    is_playing: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -40,6 +64,15 @@ struct Note {
     duration: Duration,
     accidental: Accidental,
     position: usize,
+    beam_group: Option<usize>,
+    tied_to_next: bool,
+    tuplet_group: Option<TupletGroup>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TupletGroup {
+    ratio: (u8, u8), // (3, 2) for triplets, (5, 4) for quintuplets
+    group_id: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -60,19 +93,32 @@ enum Duration {
     Half,
     Quarter,
     Eighth,
+    Sixteenth,
 }
 
 impl App {
     fn new() -> Self {
+        let initial_staves = vec![Staff {
+            notes: Vec::new(),
+            cursor_position: 0,
+            time_signature: TimeSignature { numerator: 4, denominator: 4 },
+            key_signature: KeySignature { sharps: 0 },
+        }];
+        
+        let midi_out = Self::init_midi().ok();
+        
         Self {
-            staves: vec![Staff {
-                notes: Vec::new(),
-                cursor_position: 0,
-            }],
+            staves: initial_staves.clone(),
             current_staff: 0,
             current_duration: Duration::Quarter,
             current_accidental: Accidental::Natural,
             filename: "score.json".to_string(),
+            tuplet_mode: None,
+            history: vec![Score { staves: initial_staves }],
+            history_index: 0,
+            midi_out,
+            playback_position: 0,
+            is_playing: false,
         }
     }
 
@@ -105,13 +151,36 @@ impl App {
     }
 
     fn add_note(&mut self, pitch: Pitch) {
-        if let Some(staff) = self.staves.get_mut(self.current_staff) {
-            staff.notes.retain(|note| note.position != staff.cursor_position);
+        self.save_to_history();
+        
+        let current_staff_idx = self.current_staff;
+        if let Some(staff) = self.staves.get_mut(current_staff_idx) {
+            let cursor_pos = staff.cursor_position;
+            staff.notes.retain(|note| note.position != cursor_pos);
+            
+            let beam_group = if matches!(self.current_duration, Duration::Eighth | Duration::Sixteenth) {
+                Self::calculate_beam_group_static(staff, cursor_pos)
+            } else {
+                None
+            };
+            
+            let tuplet_group = if let Some(tuplet_ratio) = self.tuplet_mode {
+                Some(TupletGroup {
+                    ratio: tuplet_ratio,
+                    group_id: cursor_pos / 3,
+                })
+            } else {
+                None
+            };
+            
             staff.notes.push(Note {
                 pitch,
                 duration: self.current_duration.clone(),
                 accidental: self.current_accidental.clone(),
-                position: staff.cursor_position,
+                position: cursor_pos,
+                beam_group,
+                tied_to_next: false,
+                tuplet_group,
             });
         }
     }
@@ -121,11 +190,14 @@ impl App {
             Duration::Whole => Duration::Half,
             Duration::Half => Duration::Quarter,
             Duration::Quarter => Duration::Eighth,
-            Duration::Eighth => Duration::Whole,
+            Duration::Eighth => Duration::Sixteenth,
+            Duration::Sixteenth => Duration::Whole,
         };
     }
 
     fn delete_note(&mut self) {
+        self.save_to_history();
+        
         if let Some(staff) = self.staves.get_mut(self.current_staff) {
             staff.notes.retain(|note| note.position != staff.cursor_position);
         }
@@ -144,6 +216,8 @@ impl App {
             self.staves.push(Staff {
                 notes: Vec::new(),
                 cursor_position: 0,
+                time_signature: TimeSignature { numerator: 4, denominator: 4 },
+                key_signature: KeySignature { sharps: 0 },
             });
         }
     }
@@ -175,6 +249,289 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn calculate_beam_group_static(staff: &Staff, position: usize) -> Option<usize> {
+        let adjacent_eighth_notes: Vec<&Note> = staff.notes.iter()
+            .filter(|note| {
+                matches!(note.duration, Duration::Eighth | Duration::Sixteenth) &&
+                note.position.abs_diff(position) <= 2
+            })
+            .collect();
+        
+        if adjacent_eighth_notes.len() > 0 {
+            Some(position / 4)
+        } else {
+            None
+        }
+    }
+
+    fn toggle_tie(&mut self) {
+        if let Some(staff) = self.staves.get_mut(self.current_staff) {
+            if let Some(note) = staff.notes.iter_mut().find(|n| n.position == staff.cursor_position) {
+                note.tied_to_next = !note.tied_to_next;
+            }
+        }
+    }
+    
+    fn toggle_triplet_mode(&mut self) {
+        self.tuplet_mode = match self.tuplet_mode {
+            None => Some((3, 2)),
+            Some((3, 2)) => Some((5, 4)),
+            Some((5, 4)) => None,
+            _ => None,
+        };
+    }
+    
+    fn cycle_time_signature(&mut self) {
+        if let Some(staff) = self.staves.get_mut(self.current_staff) {
+            staff.time_signature = match (staff.time_signature.numerator, staff.time_signature.denominator) {
+                (4, 4) => TimeSignature { numerator: 3, denominator: 4 },
+                (3, 4) => TimeSignature { numerator: 2, denominator: 4 },
+                (2, 4) => TimeSignature { numerator: 6, denominator: 8 },
+                (6, 8) => TimeSignature { numerator: 4, denominator: 4 },
+                _ => TimeSignature { numerator: 4, denominator: 4 },
+            };
+        }
+    }
+    
+    fn cycle_key_signature(&mut self) {
+        if let Some(staff) = self.staves.get_mut(self.current_staff) {
+            staff.key_signature.sharps = match staff.key_signature.sharps {
+                s if s < 7 => s + 1,
+                7 => -7,
+                s if s < 0 => s + 1,
+                _ => 0,
+            };
+        }
+    }
+    
+    fn save_to_history(&mut self) {
+        let current_score = Score { staves: self.staves.clone() };
+        if self.history_index + 1 < self.history.len() {
+            self.history.truncate(self.history_index + 1);
+        }
+        self.history.push(current_score);
+        self.history_index = self.history.len() - 1;
+        
+        // Keep history reasonable size
+        if self.history.len() > 50 {
+            self.history.remove(0);
+            self.history_index = self.history.len() - 1;
+        }
+    }
+    
+    fn undo(&mut self) {
+        if self.history_index > 0 {
+            self.history_index -= 1;
+            self.staves = self.history[self.history_index].staves.clone();
+            if self.current_staff >= self.staves.len() {
+                self.current_staff = self.staves.len().saturating_sub(1);
+            }
+        }
+    }
+    
+    fn redo(&mut self) {
+        if self.history_index + 1 < self.history.len() {
+            self.history_index += 1;
+            self.staves = self.history[self.history_index].staves.clone();
+            if self.current_staff >= self.staves.len() {
+                self.current_staff = self.staves.len().saturating_sub(1);
+            }
+        }
+    }
+    
+    fn export_musicxml(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut output = Vec::new();
+        {
+            let mut writer = EventWriter::new(&mut output);
+            
+            writer.write(XmlEvent::start_element("score-partwise").attr("version", "3.1"))?;
+            
+            // Part list
+            writer.write(XmlEvent::start_element("part-list"))?;
+            for (i, _) in self.staves.iter().enumerate() {
+                let part_id = format!("P{}", i + 1);
+                writer.write(XmlEvent::start_element("score-part").attr("id", &part_id))?;
+                writer.write(XmlEvent::start_element("part-name"))?;
+                writer.write(XmlEvent::characters(&format!("Staff {}", i + 1)))?;
+                writer.write(XmlEvent::end_element())?; // part-name
+                writer.write(XmlEvent::end_element())?; // score-part
+            }
+            writer.write(XmlEvent::end_element())?; // part-list
+            
+            // Parts
+            for (staff_idx, staff) in self.staves.iter().enumerate() {
+                let part_id = format!("P{}", staff_idx + 1);
+                writer.write(XmlEvent::start_element("part").attr("id", &part_id))?;
+                
+                // Measure
+                writer.write(XmlEvent::start_element("measure").attr("number", "1"))?;
+                
+                // Attributes (time signature, key signature)
+                writer.write(XmlEvent::start_element("attributes"))?;
+                
+                writer.write(XmlEvent::start_element("time"))?;
+                writer.write(XmlEvent::start_element("beats"))?;
+                writer.write(XmlEvent::characters(&staff.time_signature.numerator.to_string()))?;
+                writer.write(XmlEvent::end_element())?;
+                writer.write(XmlEvent::start_element("beat-type"))?;
+                writer.write(XmlEvent::characters(&staff.time_signature.denominator.to_string()))?;
+                writer.write(XmlEvent::end_element())?;
+                writer.write(XmlEvent::end_element())?; // time
+                
+                if staff.key_signature.sharps != 0 {
+                    writer.write(XmlEvent::start_element("key"))?;
+                    writer.write(XmlEvent::start_element("fifths"))?;
+                    writer.write(XmlEvent::characters(&staff.key_signature.sharps.to_string()))?;
+                    writer.write(XmlEvent::end_element())?;
+                    writer.write(XmlEvent::end_element())?; // key
+                }
+                
+                writer.write(XmlEvent::end_element())?; // attributes
+                
+                // Notes
+                for note in &staff.notes {
+                    writer.write(XmlEvent::start_element("note"))?;
+                    
+                    writer.write(XmlEvent::start_element("pitch"))?;
+                    let (step, octave) = match note.pitch {
+                        Pitch::C4 => ("C", "4"),
+                        Pitch::D4 => ("D", "4"),
+                        Pitch::E4 => ("E", "4"),
+                        Pitch::F4 => ("F", "4"),
+                        Pitch::G4 => ("G", "4"),
+                        Pitch::A4 => ("A", "4"),
+                        Pitch::B4 => ("B", "4"),
+                    };
+                    writer.write(XmlEvent::start_element("step"))?;
+                    writer.write(XmlEvent::characters(step))?;
+                    writer.write(XmlEvent::end_element())?;
+                    
+                    if note.accidental != Accidental::Natural {
+                        writer.write(XmlEvent::start_element("alter"))?;
+                        let alter = match note.accidental {
+                            Accidental::Sharp => "1",
+                            Accidental::Flat => "-1",
+                            _ => "0",
+                        };
+                        writer.write(XmlEvent::characters(alter))?;
+                        writer.write(XmlEvent::end_element())?;
+                    }
+                    
+                    writer.write(XmlEvent::start_element("octave"))?;
+                    writer.write(XmlEvent::characters(octave))?;
+                    writer.write(XmlEvent::end_element())?;
+                    writer.write(XmlEvent::end_element())?; // pitch
+                    
+                    writer.write(XmlEvent::start_element("duration"))?;
+                    let duration_value = match note.duration {
+                        Duration::Whole => "4",
+                        Duration::Half => "2",
+                        Duration::Quarter => "1",
+                        Duration::Eighth => "0.5",
+                        Duration::Sixteenth => "0.25",
+                    };
+                    writer.write(XmlEvent::characters(duration_value))?;
+                    writer.write(XmlEvent::end_element())?;
+                    
+                    writer.write(XmlEvent::start_element("type"))?;
+                    let type_name = match note.duration {
+                        Duration::Whole => "whole",
+                        Duration::Half => "half",
+                        Duration::Quarter => "quarter",
+                        Duration::Eighth => "eighth",
+                        Duration::Sixteenth => "16th",
+                    };
+                    writer.write(XmlEvent::characters(type_name))?;
+                    writer.write(XmlEvent::end_element())?;
+                    
+                    writer.write(XmlEvent::end_element())?; // note
+                }
+                
+                writer.write(XmlEvent::end_element())?; // measure
+                writer.write(XmlEvent::end_element())?; // part
+            }
+            
+            writer.write(XmlEvent::end_element())?; // score-partwise
+        }
+        
+        let xml_string = String::from_utf8(output)?;
+        fs::write("score.musicxml", xml_string)?;
+        Ok(())
+    }
+    
+    fn init_midi() -> Result<Arc<Mutex<MidiOutputConnection>>, Box<dyn std::error::Error>> {
+        let midi_out = MidiOutput::new("SCORE MIDI Output")?;
+        let out_ports = midi_out.ports();
+        
+        let port = out_ports.get(0).ok_or("No MIDI output port available")?;
+        let conn_out = midi_out.connect(port, "score-playback")?;
+        
+        Ok(Arc::new(Mutex::new(conn_out)))
+    }
+    
+    fn play_note(&self, note: &Note) {
+        if let Some(midi_out) = &self.midi_out {
+            if let Ok(mut conn) = midi_out.lock() {
+                let midi_note = match note.pitch {
+                    Pitch::C4 => 60,
+                    Pitch::D4 => 62,
+                    Pitch::E4 => 64,
+                    Pitch::F4 => 65,
+                    Pitch::G4 => 67,
+                    Pitch::A4 => 69,
+                    Pitch::B4 => 71,
+                };
+                
+                let adjusted_note = match note.accidental {
+                    Accidental::Sharp => midi_note + 1,
+                    Accidental::Flat => midi_note - 1,
+                    Accidental::Natural => midi_note,
+                };
+                
+                // Note on
+                let _ = conn.send(&[0x90, adjusted_note, 64]);
+                
+                // Schedule note off
+                let midi_out_clone = Arc::clone(&midi_out);
+                let note_duration = match note.duration {
+                    Duration::Whole => 2000,
+                    Duration::Half => 1000,
+                    Duration::Quarter => 500,
+                    Duration::Eighth => 250,
+                    Duration::Sixteenth => 125,
+                };
+                
+                thread::spawn(move || {
+                    thread::sleep(StdDuration::from_millis(note_duration));
+                    if let Ok(mut conn) = midi_out_clone.lock() {
+                        let _ = conn.send(&[0x80, adjusted_note, 64]);
+                    }
+                });
+            }
+        }
+    }
+    
+    fn toggle_playback(&mut self) {
+        self.is_playing = !self.is_playing;
+        if self.is_playing {
+            self.start_playback();
+        }
+    }
+    
+    fn start_playback(&mut self) {
+        if let Some(staff) = self.staves.get(self.current_staff) {
+            let mut notes_to_play: Vec<Note> = staff.notes.clone();
+            notes_to_play.sort_by_key(|n| n.position);
+            
+            for note in notes_to_play {
+                if !self.is_playing { break; }
+                self.play_note(&note);
+                thread::sleep(StdDuration::from_millis(100)); // Small gap between notes
+            }
+        }
+        self.is_playing = false;
     }
 }
 
@@ -228,6 +585,14 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                 KeyCode::Char('l') => { let _ = app.load_score(); },
                 KeyCode::Char('+') => app.add_staff(),
                 KeyCode::Char('-') => app.remove_staff(),
+                KeyCode::Char('t') => app.toggle_tie(),
+                KeyCode::Char('3') => app.toggle_triplet_mode(),
+                KeyCode::Char('T') => app.cycle_time_signature(),
+                KeyCode::Char('K') => app.cycle_key_signature(),
+                KeyCode::Char('z') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => app.undo(),
+                KeyCode::Char('y') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => app.redo(),
+                KeyCode::Char('x') => { let _ = app.export_musicxml(); },
+                KeyCode::Char('p') => app.toggle_playback(),
                 _ => {}
             }
         }
@@ -242,27 +607,43 @@ fn ui(f: &mut Frame, app: &App) {
         .split(f.area());
 
     let staff_content = render_all_staves(app);
+    let current_staff = &app.staves[app.current_staff];
     let staff_block = Block::default()
-        .title(format!("Score - Staff {}/{}", app.current_staff + 1, app.staves.len()))
+        .title(format!(
+            "Score - Staff {}/{} | {}/{} Time | {} Key",
+            app.current_staff + 1,
+            app.staves.len(),
+            current_staff.time_signature.numerator,
+            current_staff.time_signature.denominator,
+            format_key_signature(&current_staff.key_signature)
+        ))
         .borders(Borders::ALL);
     let staff = Paragraph::new(staff_content)
         .block(staff_block);
     
     f.render_widget(staff, chunks[0]);
 
+    let tuplet_text = match app.tuplet_mode {
+        Some((3, 2)) => " | 3=triplets",
+        Some((5, 4)) => " | 3=quintuplets", 
+        _ => " | 3=tuplets(off)",
+    };
+    
     let help_text = format!(
-        "Controls: ←→=move cursor, ↑↓=change staff, c/d/e/f/g/a/b=notes, SPACE=duration({}), #=accidental({}), +=add staff, -=remove staff, s=save, l=load, DEL=delete, q=quit",
+        "Controls: ←→=cursor, ↑↓=staff, notes=c/d/e/f/g/a/b, SPACE=duration({}), #=accidental({}), t=tie, T=time, K=key{}, +=add, -=remove, s=save, l=load, DEL=delete, q=quit",
         match app.current_duration {
             Duration::Whole => "whole",
             Duration::Half => "half", 
             Duration::Quarter => "quarter",
             Duration::Eighth => "eighth",
+            Duration::Sixteenth => "sixteenth",
         },
         match app.current_accidental {
             Accidental::Natural => "natural",
             Accidental::Sharp => "sharp",
             Accidental::Flat => "flat",
-        }
+        },
+        tuplet_text
     );
     let help = Paragraph::new(help_text)
         .block(Block::default().title("Help").borders(Borders::ALL));
@@ -320,7 +701,8 @@ fn render_single_staff(staff: &Staff, is_current: bool) -> Vec<String> {
                 Duration::Whole => "○",
                 Duration::Half => "♩", 
                 Duration::Quarter => "●",
-                Duration::Eighth => "♫",
+                Duration::Eighth => if note.beam_group.is_some() { "♪" } else { "♫" },
+                Duration::Sixteenth => "♬",
             };
             
             let accidental_symbol = match note.accidental {
@@ -333,6 +715,13 @@ fn render_single_staff(staff: &Staff, is_current: bool) -> Vec<String> {
                 staff_lines[line_idx].replace_range(pos-1..pos, accidental_symbol);
             }
             staff_lines[line_idx].replace_range(pos..pos+1, note_symbol);
+            
+            if note.tied_to_next {
+                let tie_pos = pos + 1;
+                if tie_pos < staff_lines[line_idx].len() {
+                    staff_lines[line_idx].replace_range(tie_pos..tie_pos+1, "⌢");
+                }
+            }
         }
     }
 
@@ -348,4 +737,25 @@ fn render_single_staff(staff: &Staff, is_current: bool) -> Vec<String> {
     }
 
     staff_lines
+}
+
+fn format_key_signature(key_sig: &KeySignature) -> String {
+    match key_sig.sharps {
+        0 => "C".to_string(),
+        1 => "G(1#)".to_string(),
+        2 => "D(2#)".to_string(),
+        3 => "A(3#)".to_string(),
+        4 => "E(4#)".to_string(),
+        5 => "B(5#)".to_string(),
+        6 => "F#(6#)".to_string(),
+        7 => "C#(7#)".to_string(),
+        -1 => "F(1♭)".to_string(),
+        -2 => "B♭(2♭)".to_string(),
+        -3 => "E♭(3♭)".to_string(),
+        -4 => "A♭(4♭)".to_string(),
+        -5 => "D♭(5♭)".to_string(),
+        -6 => "G♭(6♭)".to_string(),
+        -7 => "C♭(7♭)".to_string(),
+        _ => "?".to_string(),
+    }
 }

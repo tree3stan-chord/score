@@ -8,3 +8,5 @@ ratatui = "0.28"
 crossterm = "0.28"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+xml-rs = "0.8"
+midir = "0.10"

@@ -1,0 +1,91 @@
+{
+  "staves": [
+    {
+      "notes": [
+        {
+          "pitch": "C4",
+          "duration": "Quarter",
+          "accidental": "Natural",
+          "position": 0,
+          "beam_group": null,
+          "tied_to_next": false,
+          "tuplet_group": null
+        },
+        {
+          "pitch": "E4",
+          "duration": "Eighth",
+          "accidental": "Sharp",
+          "position": 1,
+          "beam_group": 0,
+          "tied_to_next": true,
+          "tuplet_group": {
+            "ratio": [3, 2],
+            "group_id": 0
+          }
+        },
+        {
+          "pitch": "G4",
+          "duration": "Sixteenth",
+          "accidental": "Flat",
+          "position": 2,
+          "beam_group": 0,
+          "tied_to_next": false,
+          "tuplet_group": {
+            "ratio": [3, 2],
+            "group_id": 0
+          }
+        },
+        {
+          "pitch": "B4",
+          "duration": "Half",
+          "accidental": "Natural",
+          "position": 4,
+          "beam_group": null,
+          "tied_to_next": false,
+          "tuplet_group": null
+        }
+      ],
+      "cursor_position": 5,
+      "time_signature": {
+        "numerator": 3,
+        "denominator": 4
+      },
+      "key_signature": {
+        "sharps": 2
+      }
+    },
+    {
+      "notes": [
+        {
+          "pitch": "F4",
+          "duration": "Whole",
+          "accidental": "Sharp",
+          "position": 0,
+          "beam_group": null,
+          "tied_to_next": false,
+          "tuplet_group": null
+        },
+        {
+          "pitch": "A4",
+          "duration": "Quarter",
+          "accidental": "Flat",
+          "position": 4,
+          "beam_group": null,
+          "tied_to_next": false,
+          "tuplet_group": {
+            "ratio": [5, 4],
+            "group_id": 1
+          }
+        }
+      ],
+      "cursor_position": 6,
+      "time_signature": {
+        "numerator": 4,
+        "denominator": 4
+      },
+      "key_signature": {
+        "sharps": -3
+      }
+    }
+  ]
+}
