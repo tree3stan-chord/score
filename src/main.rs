@@ -5,14 +5,14 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
-    text::Text,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Style, Modifier},
+    text::{Text, Span, Line},
     widgets::{Block, Borders, Paragraph},
     Terminal, Frame,
 };
 use std::fs;
-use std::io::{self, stdout, Write};
+use std::io::{self, stdout};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration as StdDuration;
@@ -26,6 +26,8 @@ struct Staff {
     cursor_position: usize,
     time_signature: TimeSignature,
     key_signature: KeySignature,
+    scroll_offset: usize,
+    max_length: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -54,8 +56,20 @@ struct App {
     history: Vec<Score>,
     history_index: usize,
     midi_out: Option<Arc<Mutex<MidiOutputConnection>>>,
-    playback_position: usize,
     is_playing: bool,
+    setup_mode: bool,
+    setup_field: SetupField,
+    viewport_width: usize,
+    scroll_animation: f32,
+}
+
+#[derive(Clone, PartialEq)]
+enum SetupField {
+    TimeNumerator,
+    TimeDenominator, 
+    KeySignature,
+    StaffCount,
+    Done,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -103,6 +117,8 @@ impl App {
             cursor_position: 0,
             time_signature: TimeSignature { numerator: 4, denominator: 4 },
             key_signature: KeySignature { sharps: 0 },
+            scroll_offset: 0,
+            max_length: 64, // Start with 64 beats, can expand
         }];
         
         let midi_out = Self::init_midi().ok();
@@ -117,24 +133,58 @@ impl App {
             history: vec![Score { staves: initial_staves }],
             history_index: 0,
             midi_out,
-            playback_position: 0,
             is_playing: false,
+            setup_mode: true,
+            setup_field: SetupField::TimeNumerator,
+            viewport_width: 16, // Default viewport shows 16 beats
+            scroll_animation: 0.0,
         }
     }
 
     fn move_cursor_right(&mut self) {
-        if let Some(staff) = self.staves.get_mut(self.current_staff) {
-            if staff.cursor_position < 15 {
+        let current_staff_idx = self.current_staff;
+        if let Some(staff) = self.staves.get_mut(current_staff_idx) {
+            if staff.cursor_position < staff.max_length - 1 {
                 staff.cursor_position += 1;
+                
+                // Auto-expand staff if approaching the end
+                if staff.cursor_position > staff.max_length - 8 {
+                    staff.max_length += 16; // Expand by 16 beats
+                }
             }
         }
+        self.update_viewport();
     }
 
     fn move_cursor_left(&mut self) {
-        if let Some(staff) = self.staves.get_mut(self.current_staff) {
+        let current_staff_idx = self.current_staff;
+        if let Some(staff) = self.staves.get_mut(current_staff_idx) {
             if staff.cursor_position > 0 {
                 staff.cursor_position -= 1;
             }
+        }
+        self.update_viewport();
+    }
+    
+    fn update_viewport(&mut self) {
+        if let Some(staff) = self.staves.get_mut(self.current_staff) {
+            let cursor_pos = staff.cursor_position;
+            let current_scroll = staff.scroll_offset;
+            let _viewport_end = current_scroll + self.viewport_width;
+            
+            // Scroll right if cursor moves beyond 75% of viewport
+            if cursor_pos >= current_scroll + (self.viewport_width * 3 / 4) {
+                staff.scroll_offset = cursor_pos.saturating_sub(self.viewport_width / 4);
+                self.scroll_animation = 1.0;
+            }
+            // Scroll left if cursor moves before 25% of viewport
+            else if cursor_pos < current_scroll + (self.viewport_width / 4) {
+                staff.scroll_offset = cursor_pos.saturating_sub(self.viewport_width * 3 / 4);
+                self.scroll_animation = -1.0;
+            }
+            
+            // Ensure we don't scroll past the beginning
+            staff.scroll_offset = staff.scroll_offset.min(staff.max_length.saturating_sub(self.viewport_width));
         }
     }
 
@@ -218,6 +268,8 @@ impl App {
                 cursor_position: 0,
                 time_signature: TimeSignature { numerator: 4, denominator: 4 },
                 key_signature: KeySignature { sharps: 0 },
+                scroll_offset: 0,
+                max_length: 64,
             });
         }
     }
@@ -533,6 +585,78 @@ impl App {
         }
         self.is_playing = false;
     }
+    
+    fn handle_setup_input(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Enter => {
+                self.setup_field = match self.setup_field {
+                    SetupField::TimeNumerator => SetupField::TimeDenominator,
+                    SetupField::TimeDenominator => SetupField::KeySignature,
+                    SetupField::KeySignature => SetupField::StaffCount,
+                    SetupField::StaffCount => SetupField::Done,
+                    SetupField::Done => {
+                        self.setup_mode = false;
+                        self.setup_field = SetupField::Done;
+                        return;
+                    }
+                };
+            }
+            KeyCode::Up => {
+                if let Some(staff) = self.staves.get_mut(0) {
+                    match self.setup_field {
+                        SetupField::TimeNumerator => {
+                            staff.time_signature.numerator = (staff.time_signature.numerator % 12) + 1;
+                        }
+                        SetupField::TimeDenominator => {
+                            staff.time_signature.denominator = match staff.time_signature.denominator {
+                                2 => 4, 4 => 8, 8 => 16, _ => 2,
+                            };
+                        }
+                        SetupField::KeySignature => {
+                            staff.key_signature.sharps = (staff.key_signature.sharps + 1).clamp(-7, 7);
+                        }
+                        SetupField::StaffCount => {
+                            if self.staves.len() < 4 {
+                                self.add_staff();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if let Some(staff) = self.staves.get_mut(0) {
+                    match self.setup_field {
+                        SetupField::TimeNumerator => {
+                            staff.time_signature.numerator = if staff.time_signature.numerator > 1 {
+                                staff.time_signature.numerator - 1
+                            } else {
+                                12
+                            };
+                        }
+                        SetupField::TimeDenominator => {
+                            staff.time_signature.denominator = match staff.time_signature.denominator {
+                                16 => 8, 8 => 4, 4 => 2, _ => 16,
+                            };
+                        }
+                        SetupField::KeySignature => {
+                            staff.key_signature.sharps = (staff.key_signature.sharps - 1).clamp(-7, 7);
+                        }
+                        SetupField::StaffCount => {
+                            if self.staves.len() > 1 {
+                                self.remove_staff();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                self.setup_mode = false;
+            }
+            _ => {}
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -563,8 +687,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     loop {
         terminal.draw(|f| ui(f, app))?;
+        
+        // Decay scroll animation
+        if app.scroll_animation != 0.0 {
+            app.scroll_animation *= 0.8; // Fade animation
+            if app.scroll_animation.abs() < 0.1 {
+                app.scroll_animation = 0.0;
+            }
+        }
 
         if let Event::Key(key) = event::read()? {
+            if app.setup_mode {
+                app.handle_setup_input(key.code);
+                continue;
+            }
             match key.code {
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Left => app.move_cursor_left(),
@@ -593,6 +729,37 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                 KeyCode::Char('y') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => app.redo(),
                 KeyCode::Char('x') => { let _ = app.export_musicxml(); },
                 KeyCode::Char('p') => app.toggle_playback(),
+                KeyCode::F(1) => { app.setup_mode = true; app.setup_field = SetupField::TimeNumerator; },
+                KeyCode::Home => {
+                    if let Some(staff) = app.staves.get_mut(app.current_staff) {
+                        staff.cursor_position = 0;
+                        staff.scroll_offset = 0;
+                        app.scroll_animation = -1.0;
+                    }
+                },
+                KeyCode::End => {
+                    if let Some(staff) = app.staves.get_mut(app.current_staff) {
+                        staff.cursor_position = staff.max_length.saturating_sub(1);
+                        app.update_viewport();
+                        app.scroll_animation = 1.0;
+                    }
+                },
+                KeyCode::PageUp => {
+                    if let Some(staff) = app.staves.get_mut(app.current_staff) {
+                        let jump = app.viewport_width / 2;
+                        staff.cursor_position = staff.cursor_position.saturating_sub(jump);
+                        app.update_viewport();
+                        app.scroll_animation = -1.0;
+                    }
+                },
+                KeyCode::PageDown => {
+                    if let Some(staff) = app.staves.get_mut(app.current_staff) {
+                        let jump = app.viewport_width / 2;
+                        staff.cursor_position = (staff.cursor_position + jump).min(staff.max_length - 1);
+                        app.update_viewport();
+                        app.scroll_animation = 1.0;
+                    }
+                },
                 _ => {}
             }
         }
@@ -600,6 +767,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
 }
 
 fn ui(f: &mut Frame, app: &App) {
+    if app.setup_mode {
+        render_setup_screen(f, app);
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -608,16 +779,28 @@ fn ui(f: &mut Frame, app: &App) {
 
     let staff_content = render_all_staves(app);
     let current_staff = &app.staves[app.current_staff];
+    let scroll_info = if current_staff.max_length > app.viewport_width {
+        format!(" | Pos: {}-{}/{}", 
+                current_staff.scroll_offset + 1, 
+                (current_staff.scroll_offset + app.viewport_width).min(current_staff.max_length),
+                current_staff.max_length)
+    } else {
+        String::new()
+    };
+    
     let staff_block = Block::default()
         .title(format!(
-            "Score - Staff {}/{} | {}/{} Time | {} Key",
+            "🎼 Score - Staff {}/{} | {}/{} Time | {} Key{}{}",
             app.current_staff + 1,
             app.staves.len(),
             current_staff.time_signature.numerator,
             current_staff.time_signature.denominator,
-            format_key_signature(&current_staff.key_signature)
+            format_key_signature(&current_staff.key_signature),
+            scroll_info,
+            if app.is_playing { " ♪ PLAYING ♪" } else { "" }
         ))
-        .borders(Borders::ALL);
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue));
     let staff = Paragraph::new(staff_content)
         .block(staff_block);
     
@@ -630,7 +813,7 @@ fn ui(f: &mut Frame, app: &App) {
     };
     
     let help_text = format!(
-        "Controls: ←→=cursor, ↑↓=staff, notes=c/d/e/f/g/a/b, SPACE=duration({}), #=accidental({}), t=tie, T=time, K=key{}, +=add, -=remove, s=save, l=load, DEL=delete, q=quit",
+        "Controls: ←→=cursor, ↑↓=staff, Home/End=jump, PgUp/PgDn=scroll, notes=c/d/e/f/g/a/b, SPACE=duration({}), #=accidental({}), t=tie, F1=setup{}, +=add, -=remove, p=play, x=export, s=save, l=load, DEL=delete, q=quit",
         match app.current_duration {
             Duration::Whole => "whole",
             Duration::Half => "half", 
@@ -651,6 +834,110 @@ fn ui(f: &mut Frame, app: &App) {
     f.render_widget(help, chunks[1]);
 }
 
+fn render_setup_screen(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([
+            Constraint::Length(3),  // Title
+            Constraint::Length(10), // Setup form
+            Constraint::Min(2),     // Instructions
+        ])
+        .split(f.area());
+    
+    // Title
+    let title = Paragraph::new(
+        Line::from(vec![
+            Span::styled("🎼 SCORE Setup - Configure Your Score", 
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        ])
+    )
+    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Blue)))
+    .style(Style::default().bg(Color::Black));
+    
+    f.render_widget(title, chunks[0]);
+    
+    // Setup form
+    let staff = app.staves.get(0).unwrap();
+    let current_field = &app.setup_field;
+    
+    let form_lines = vec![
+        Line::from(vec![
+            Span::styled("Time Signature: ", Style::default().fg(Color::White)),
+            Span::styled(
+                format!(" {}/{}  ", staff.time_signature.numerator, staff.time_signature.denominator),
+                if *current_field == SetupField::TimeNumerator || *current_field == SetupField::TimeDenominator {
+                    Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Green)
+                }
+            )
+        ]),
+        Line::from(" "),
+        Line::from(vec![
+            Span::styled("Key Signature:  ", Style::default().fg(Color::White)),
+            Span::styled(
+                format!(" {}  ", format_key_signature(&staff.key_signature)),
+                if *current_field == SetupField::KeySignature {
+                    Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Green)
+                }
+            )
+        ]),
+        Line::from(" "),
+        Line::from(vec![
+            Span::styled("Staff Count:    ", Style::default().fg(Color::White)),
+            Span::styled(
+                format!(" {}  ", app.staves.len()),
+                if *current_field == SetupField::StaffCount {
+                    Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Green)
+                }
+            )
+        ]),
+        Line::from(" "),
+        Line::from(vec![
+            Span::styled(
+                if *current_field == SetupField::Done { "▶ START COMPOSING" } else { "  Start Composing  " },
+                if *current_field == SetupField::Done {
+                    Style::default().bg(Color::Green).fg(Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                }
+            )
+        ]),
+    ];
+    
+    let form = Paragraph::new(form_lines)
+        .block(Block::default().borders(Borders::ALL).title("Settings").border_style(Style::default().fg(Color::Green)));
+    
+    f.render_widget(form, chunks[1]);
+    
+    // Instructions
+    let instructions = vec![
+        Line::from(vec![
+            Span::styled("Controls: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw("↑/↓ = Adjust values  |  "),
+            Span::styled("Enter", Style::default().fg(Color::Green)),
+            Span::raw(" = Next field  |  "),
+            Span::styled("Esc", Style::default().fg(Color::Red)),
+            Span::raw(" = Skip setup")
+        ]),
+        Line::from(" "),
+        Line::from(vec![
+            Span::styled("Tip: ", Style::default().fg(Color::Cyan)),
+            Span::raw("You can also press F1 anytime during composition to return to this setup screen.")
+        ]),
+    ];
+    
+    let help = Paragraph::new(instructions)
+        .block(Block::default().borders(Borders::ALL).title("Help").border_style(Style::default().fg(Color::Cyan)));
+    
+    f.render_widget(help, chunks[2]);
+}
+
 fn render_all_staves(app: &App) -> Text<'_> {
     let mut all_lines = Vec::new();
     
@@ -659,32 +946,62 @@ fn render_all_staves(app: &App) -> Text<'_> {
             all_lines.push("".to_string());
         }
         
-        let staff_lines = render_single_staff(staff, staff_idx == app.current_staff);
+        let staff_lines = render_single_staff(staff, staff_idx == app.current_staff, app.viewport_width);
         all_lines.extend(staff_lines);
+    }
+    
+    // Add animation hint if scrolling
+    if app.scroll_animation != 0.0 {
+        let scroll_hint = if app.scroll_animation > 0.0 {
+            "                    >>> Scrolling Right >>>"
+        } else {
+            "                    <<< Scrolling Left <<<"
+        };
+        all_lines.push("".to_string());
+        all_lines.push(scroll_hint.to_string());
     }
     
     Text::raw(all_lines.join("\n"))
 }
 
-fn render_single_staff(staff: &Staff, is_current: bool) -> Vec<String> {
+fn render_single_staff(staff: &Staff, is_current: bool, viewport_width: usize) -> Vec<String> {
     let line_char = if is_current { "─" } else { "·" };
     let space_char = if is_current { " " } else { " " };
     
+    // Calculate visible range based on scroll offset
+    let start_pos = staff.scroll_offset;
+    let end_pos = (start_pos + viewport_width).min(staff.max_length);
+    let visible_width = (end_pos - start_pos) * 5;
+    
     let mut staff_lines = vec![
-        format!("{}", space_char.repeat(80)), // E5 line
-        format!("{}", space_char.repeat(80)), // D5 space
-        format!("{}", line_char.repeat(16).repeat(5)), // C5 line
-        format!("{}", space_char.repeat(80)), // B4 space
-        format!("{}", line_char.repeat(16).repeat(5)), // A4 line
-        format!("{}", space_char.repeat(80)), // G4 space
-        format!("{}", line_char.repeat(16).repeat(5)), // F4 line
-        format!("{}", space_char.repeat(80)), // E4 space
-        format!("{}", line_char.repeat(16).repeat(5)), // D4 line
-        format!("{}", space_char.repeat(80)), // C4 space
-        format!("{}", line_char.repeat(16).repeat(5)), // B3 line
+        format!("{}", space_char.repeat(visible_width)), // E5 line
+        format!("{}", space_char.repeat(visible_width)), // D5 space
+        format!("{}", line_char.repeat(visible_width)), // C5 line
+        format!("{}", space_char.repeat(visible_width)), // B4 space
+        format!("{}", line_char.repeat(visible_width)), // A4 line
+        format!("{}", space_char.repeat(visible_width)), // G4 space
+        format!("{}", line_char.repeat(visible_width)), // F4 line
+        format!("{}", space_char.repeat(visible_width)), // E4 space
+        format!("{}", line_char.repeat(visible_width)), // D4 line
+        format!("{}", space_char.repeat(visible_width)), // C4 space
+        format!("{}", line_char.repeat(visible_width)), // B3 line
     ];
+    
+    // Add default rests to empty positions in visible range
+    for position in start_pos..end_pos {
+        let pos = (position - start_pos) * 5;
+        let has_note = staff.notes.iter().any(|note| note.position == position);
+        if !has_note && pos < staff_lines[8].len() {
+            staff_lines[8].replace_range(pos..pos+1, "𝄽"); // Quarter rest on middle line
+        }
+    }
 
+    // Render notes in visible range
     for note in &staff.notes {
+        if note.position < start_pos || note.position >= end_pos {
+            continue; // Skip notes outside viewport
+        }
+        
         let line_idx = match note.pitch {
             Pitch::C4 => 9,
             Pitch::D4 => 8,
@@ -695,7 +1012,7 @@ fn render_single_staff(staff: &Staff, is_current: bool) -> Vec<String> {
             Pitch::B4 => 3,
         };
         
-        let pos = note.position * 5;
+        let pos = (note.position - start_pos) * 5;
         if pos < staff_lines[line_idx].len() {
             let note_symbol = match note.duration {
                 Duration::Whole => "○",
@@ -725,12 +1042,34 @@ fn render_single_staff(staff: &Staff, is_current: bool) -> Vec<String> {
         }
     }
 
-    if is_current {
-        let cursor_pos = staff.cursor_position * 5;
+    // Render cursor if it's in visible range
+    if is_current && staff.cursor_position >= start_pos && staff.cursor_position < end_pos {
+        let cursor_pos = (staff.cursor_position - start_pos) * 5;
         if cursor_pos < staff_lines[0].len() {
             for line in staff_lines.iter_mut() {
                 if line.chars().nth(cursor_pos).unwrap_or(' ') == ' ' {
-                    line.replace_range(cursor_pos..cursor_pos+1, "│");
+                    line.replace_range(cursor_pos..cursor_pos+1, "║");
+                }
+            }
+        }
+    }
+    
+    // Add scroll indicators
+    if is_current {
+        if start_pos > 0 {
+            // Left scroll indicator
+            for line in staff_lines.iter_mut() {
+                if line.len() > 0 {
+                    line.replace_range(0..1, "◀");
+                }
+            }
+        }
+        if end_pos < staff.max_length {
+            // Right scroll indicator
+            for line in staff_lines.iter_mut() {
+                let last_pos = line.len().saturating_sub(1);
+                if last_pos > 0 {
+                    line.replace_range(last_pos..last_pos+1, "▶");
                 }
             }
         }
@@ -741,21 +1080,21 @@ fn render_single_staff(staff: &Staff, is_current: bool) -> Vec<String> {
 
 fn format_key_signature(key_sig: &KeySignature) -> String {
     match key_sig.sharps {
-        0 => "C".to_string(),
-        1 => "G(1#)".to_string(),
-        2 => "D(2#)".to_string(),
-        3 => "A(3#)".to_string(),
-        4 => "E(4#)".to_string(),
-        5 => "B(5#)".to_string(),
-        6 => "F#(6#)".to_string(),
-        7 => "C#(7#)".to_string(),
-        -1 => "F(1♭)".to_string(),
-        -2 => "B♭(2♭)".to_string(),
-        -3 => "E♭(3♭)".to_string(),
-        -4 => "A♭(4♭)".to_string(),
-        -5 => "D♭(5♭)".to_string(),
-        -6 => "G♭(6♭)".to_string(),
-        -7 => "C♭(7♭)".to_string(),
-        _ => "?".to_string(),
+        0 => "C major".to_string(),
+        1 => "G major (1#)".to_string(),
+        2 => "D major (2#)".to_string(),
+        3 => "A major (3#)".to_string(),
+        4 => "E major (4#)".to_string(),
+        5 => "B major (5#)".to_string(),
+        6 => "F# major (6#)".to_string(),
+        7 => "C# major (7#)".to_string(),
+        -1 => "F major (1♭)".to_string(),
+        -2 => "B♭ major (2♭)".to_string(),
+        -3 => "E♭ major (3♭)".to_string(),
+        -4 => "A♭ major (4♭)".to_string(),
+        -5 => "D♭ major (5♭)".to_string(),
+        -6 => "G♭ major (6♭)".to_string(),
+        -7 => "C♭ major (7♭)".to_string(),
+        _ => "Unknown".to_string(),
     }
 }
