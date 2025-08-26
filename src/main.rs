@@ -11,16 +11,30 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Terminal, Frame,
 };
+use std::fs;
 use std::io::{self, stdout};
+use serde::{Deserialize, Serialize};
 
-struct App {
-    cursor_position: usize,
+#[derive(Clone, Serialize, Deserialize)]
+struct Staff {
     notes: Vec<Note>,
-    current_duration: Duration,
-    current_accidental: Accidental,
+    cursor_position: usize,
 }
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize)]
+struct Score {
+    staves: Vec<Staff>,
+}
+
+struct App {
+    staves: Vec<Staff>,
+    current_staff: usize,
+    current_duration: Duration,
+    current_accidental: Accidental,
+    filename: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct Note {
     pitch: Pitch,
     duration: Duration,
@@ -28,19 +42,19 @@ struct Note {
     position: usize,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 enum Pitch {
     C4, D4, E4, F4, G4, A4, B4,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 enum Accidental {
     Natural,
     Sharp,
     Flat,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 enum Duration {
     Whole,
     Half,
@@ -51,33 +65,55 @@ enum Duration {
 impl App {
     fn new() -> Self {
         Self {
-            cursor_position: 0,
-            notes: Vec::new(),
+            staves: vec![Staff {
+                notes: Vec::new(),
+                cursor_position: 0,
+            }],
+            current_staff: 0,
             current_duration: Duration::Quarter,
             current_accidental: Accidental::Natural,
+            filename: "score.json".to_string(),
         }
     }
 
     fn move_cursor_right(&mut self) {
-        if self.cursor_position < 15 {
-            self.cursor_position += 1;
+        if let Some(staff) = self.staves.get_mut(self.current_staff) {
+            if staff.cursor_position < 15 {
+                staff.cursor_position += 1;
+            }
         }
     }
 
     fn move_cursor_left(&mut self) {
-        if self.cursor_position > 0 {
-            self.cursor_position -= 1;
+        if let Some(staff) = self.staves.get_mut(self.current_staff) {
+            if staff.cursor_position > 0 {
+                staff.cursor_position -= 1;
+            }
+        }
+    }
+
+    fn move_staff_up(&mut self) {
+        if self.current_staff > 0 {
+            self.current_staff -= 1;
+        }
+    }
+
+    fn move_staff_down(&mut self) {
+        if self.current_staff + 1 < self.staves.len() {
+            self.current_staff += 1;
         }
     }
 
     fn add_note(&mut self, pitch: Pitch) {
-        self.notes.retain(|note| note.position != self.cursor_position);
-        self.notes.push(Note {
-            pitch,
-            duration: self.current_duration.clone(),
-            accidental: self.current_accidental.clone(),
-            position: self.cursor_position,
-        });
+        if let Some(staff) = self.staves.get_mut(self.current_staff) {
+            staff.notes.retain(|note| note.position != staff.cursor_position);
+            staff.notes.push(Note {
+                pitch,
+                duration: self.current_duration.clone(),
+                accidental: self.current_accidental.clone(),
+                position: staff.cursor_position,
+            });
+        }
     }
 
     fn cycle_duration(&mut self) {
@@ -90,7 +126,9 @@ impl App {
     }
 
     fn delete_note(&mut self) {
-        self.notes.retain(|note| note.position != self.cursor_position);
+        if let Some(staff) = self.staves.get_mut(self.current_staff) {
+            staff.notes.retain(|note| note.position != staff.cursor_position);
+        }
     }
 
     fn cycle_accidental(&mut self) {
@@ -99,6 +137,44 @@ impl App {
             Accidental::Sharp => Accidental::Flat,
             Accidental::Flat => Accidental::Natural,
         };
+    }
+
+    fn add_staff(&mut self) {
+        if self.staves.len() < 4 {
+            self.staves.push(Staff {
+                notes: Vec::new(),
+                cursor_position: 0,
+            });
+        }
+    }
+
+    fn remove_staff(&mut self) {
+        if self.staves.len() > 1 {
+            self.staves.remove(self.current_staff);
+            if self.current_staff >= self.staves.len() {
+                self.current_staff = self.staves.len() - 1;
+            }
+        }
+    }
+
+    fn save_score(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let score = Score {
+            staves: self.staves.clone(),
+        };
+        let json = serde_json::to_string_pretty(&score)?;
+        fs::write(&self.filename, json)?;
+        Ok(())
+    }
+
+    fn load_score(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Ok(contents) = fs::read_to_string(&self.filename) {
+            let score: Score = serde_json::from_str(&contents)?;
+            self.staves = score.staves;
+            if self.current_staff >= self.staves.len() {
+                self.current_staff = 0;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -136,6 +212,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Left => app.move_cursor_left(),
                 KeyCode::Right => app.move_cursor_right(),
+                KeyCode::Up => app.move_staff_up(),
+                KeyCode::Down => app.move_staff_down(),
                 KeyCode::Char('c') => app.add_note(Pitch::C4),
                 KeyCode::Char('d') => app.add_note(Pitch::D4),
                 KeyCode::Char('e') => app.add_note(Pitch::E4),
@@ -146,6 +224,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                 KeyCode::Char(' ') => app.cycle_duration(),
                 KeyCode::Delete | KeyCode::Backspace => app.delete_note(),
                 KeyCode::Char('#') => app.cycle_accidental(),
+                KeyCode::Char('s') => { let _ = app.save_score(); },
+                KeyCode::Char('l') => { let _ = app.load_score(); },
+                KeyCode::Char('+') => app.add_staff(),
+                KeyCode::Char('-') => app.remove_staff(),
                 _ => {}
             }
         }
@@ -159,18 +241,17 @@ fn ui(f: &mut Frame, app: &App) {
         .constraints([Constraint::Min(5), Constraint::Length(3)])
         .split(f.area());
 
+    let staff_content = render_all_staves(app);
     let staff_block = Block::default()
-        .title("Score")
+        .title(format!("Score - Staff {}/{}", app.current_staff + 1, app.staves.len()))
         .borders(Borders::ALL);
-    
-    let staff_content = render_staff(app);
     let staff = Paragraph::new(staff_content)
         .block(staff_block);
     
     f.render_widget(staff, chunks[0]);
 
     let help_text = format!(
-        "Controls: Arrow keys=move, c/d/e/f/g/a/b=notes, SPACE=duration({}), #=accidental({}), DEL=delete, q=quit",
+        "Controls: ←→=move cursor, ↑↓=change staff, c/d/e/f/g/a/b=notes, SPACE=duration({}), #=accidental({}), +=add staff, -=remove staff, s=save, l=load, DEL=delete, q=quit",
         match app.current_duration {
             Duration::Whole => "whole",
             Duration::Half => "half", 
@@ -189,22 +270,40 @@ fn ui(f: &mut Frame, app: &App) {
     f.render_widget(help, chunks[1]);
 }
 
-fn render_staff(app: &App) -> Text<'_> {
+fn render_all_staves(app: &App) -> Text<'_> {
+    let mut all_lines = Vec::new();
+    
+    for (staff_idx, staff) in app.staves.iter().enumerate() {
+        if staff_idx > 0 {
+            all_lines.push("".to_string());
+        }
+        
+        let staff_lines = render_single_staff(staff, staff_idx == app.current_staff);
+        all_lines.extend(staff_lines);
+    }
+    
+    Text::raw(all_lines.join("\n"))
+}
+
+fn render_single_staff(staff: &Staff, is_current: bool) -> Vec<String> {
+    let line_char = if is_current { "─" } else { "·" };
+    let space_char = if is_current { " " } else { " " };
+    
     let mut staff_lines = vec![
-        "     ".repeat(16), // E5 line
-        "     ".repeat(16), // D5 space
-        "─────".repeat(16), // C5 line
-        "     ".repeat(16), // B4 space
-        "─────".repeat(16), // A4 line
-        "     ".repeat(16), // G4 space
-        "─────".repeat(16), // F4 line
-        "     ".repeat(16), // E4 space
-        "─────".repeat(16), // D4 line
-        "     ".repeat(16), // C4 space
-        "─────".repeat(16), // B3 line
+        format!("{}", space_char.repeat(80)), // E5 line
+        format!("{}", space_char.repeat(80)), // D5 space
+        format!("{}", line_char.repeat(16).repeat(5)), // C5 line
+        format!("{}", space_char.repeat(80)), // B4 space
+        format!("{}", line_char.repeat(16).repeat(5)), // A4 line
+        format!("{}", space_char.repeat(80)), // G4 space
+        format!("{}", line_char.repeat(16).repeat(5)), // F4 line
+        format!("{}", space_char.repeat(80)), // E4 space
+        format!("{}", line_char.repeat(16).repeat(5)), // D4 line
+        format!("{}", space_char.repeat(80)), // C4 space
+        format!("{}", line_char.repeat(16).repeat(5)), // B3 line
     ];
 
-    for note in &app.notes {
+    for note in &staff.notes {
         let line_idx = match note.pitch {
             Pitch::C4 => 9,
             Pitch::D4 => 8,
@@ -237,14 +336,16 @@ fn render_staff(app: &App) -> Text<'_> {
         }
     }
 
-    let cursor_pos = app.cursor_position * 5;
-    if cursor_pos < staff_lines[0].len() {
-        for line in staff_lines.iter_mut() {
-            if line.chars().nth(cursor_pos) == Some(' ') {
-                line.replace_range(cursor_pos..cursor_pos+1, "│");
+    if is_current {
+        let cursor_pos = staff.cursor_position * 5;
+        if cursor_pos < staff_lines[0].len() {
+            for line in staff_lines.iter_mut() {
+                if line.chars().nth(cursor_pos).unwrap_or(' ') == ' ' {
+                    line.replace_range(cursor_pos..cursor_pos+1, "│");
+                }
             }
         }
     }
 
-    Text::raw(staff_lines.join("\n"))
+    staff_lines
 }
